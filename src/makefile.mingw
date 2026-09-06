@@ -20,7 +20,6 @@ LIBPATHS= \
  -L"/deps/miniupnpc" 
  
 LIBS= \
- -l boost_system-mgw48-mt-d-1_55 \
  -l boost_filesystem-mgw48-mt-d-1_55 \
  -l boost_program_options-mgw48-mt-d-1_55 \
  -l boost_thread-mgw48-mt-d-1_55 \

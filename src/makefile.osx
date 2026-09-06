@@ -28,7 +28,6 @@ ifdef STATIC
 # Build STATIC if you are redistributing the bitcoind binary
 LIBS += \
  $(DEPSDIR)/lib/db48/libdb_cxx-4.8.a \
- $(DEPSDIR)/lib/libboost_system-mt.a \
  $(DEPSDIR)/lib/libboost_filesystem-mt.a \
  $(DEPSDIR)/lib/libboost_program_options-mt.a \
  $(DEPSDIR)/lib/libboost_thread-mt.a \
@@ -38,7 +37,6 @@ LIBS += \
 else
 LIBS += \
  -ldb_cxx-4.8 \
- -lboost_system-mt \
  -lboost_filesystem-mt \
  -lboost_program_options-mt \
  -lboost_thread-mt \

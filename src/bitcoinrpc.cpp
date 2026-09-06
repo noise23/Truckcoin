@@ -368,6 +368,41 @@ static string HTTPReply(int nStatus, const string& strMsg, bool keepalive)
         strMsg.c_str());
 }
 
+bool ReadHTTPRequestLine(std::basic_istream<char>& stream, int &proto,
+                         string& http_method, string& http_uri)
+{
+    string str;
+    getline(stream, str);
+
+    // HTTP request line is space-delimited
+    vector<string> vWords;
+    boost::split(vWords, str, boost::is_any_of(" "));
+    if (vWords.size() < 2)
+        return false;
+
+    // HTTP methods permitted: GET, POST
+    http_method = vWords[0];
+    if (http_method != "GET" && http_method != "POST")
+        return false;
+
+    // HTTP URI must be an absolute path, relative to current host
+    http_uri = vWords[1];
+    if (http_uri.size() == 0 || http_uri[0] != '/')
+        return false;
+
+    // parse proto, if present
+    string strProto = "";
+    if (vWords.size() > 2)
+        strProto = vWords[2];
+
+    proto = 0;
+    const char *ver = strstr(strProto.c_str(), "HTTP/1.");
+    if (ver != NULL)
+        proto = atoi(ver+7);
+
+    return true;
+}
+
 int ReadHTTPStatus(std::basic_istream<char>& stream, int &proto)
 {
     string str;
@@ -383,7 +418,7 @@ int ReadHTTPStatus(std::basic_istream<char>& stream, int &proto)
     return atoi(vWords[1].c_str());
 }
 
-int ReadHTTPHeader(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet)
+int ReadHTTPHeaders(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet)
 {
     int nLen = 0;
     while (true)
@@ -408,17 +443,15 @@ int ReadHTTPHeader(std::basic_istream<char>& stream, map<string, string>& mapHea
     return nLen;
 }
 
-int ReadHTTP(std::basic_istream<char>& stream, map<string, string>& mapHeadersRet, string& strMessageRet)
+int ReadHTTPMessage(std::basic_istream<char>& stream, map<string,
+                    string>& mapHeadersRet, string& strMessageRet,
+                    int nProto)
 {
     mapHeadersRet.clear();
     strMessageRet = "";
 
-    // Read status
-    int nProto = 0;
-    int nStatus = ReadHTTPStatus(stream, nProto);
-
     // Read header
-    int nLen = ReadHTTPHeader(stream, mapHeadersRet);
+    int nLen = ReadHTTPHeaders(stream, mapHeadersRet);
     if (nLen < 0 || nLen > (int)MAX_SIZE)
         return HTTP_INTERNAL_SERVER_ERROR;
 
@@ -440,7 +473,7 @@ int ReadHTTP(std::basic_istream<char>& stream, map<string, string>& mapHeadersRe
             mapHeadersRet["connection"] = "close";
     }
 
-    return nStatus;
+    return HTTP_OK;
 }
 
 bool HTTPAuthorized(map<string, string>& mapHeaders)
@@ -505,9 +538,9 @@ bool ClientAllowed(const boost::asio::ip::address& address)
 {
     // Make sure that IPv4-compatible and IPv4-mapped IPv6 addresses are treated as IPv4 addresses
     if (address.is_v6()
-     && (address.to_v6().is_v4_compatible()
-      || address.to_v6().is_v4_mapped()))
-        return ClientAllowed(address.to_v6().to_v4());
+     && address.to_v6().is_v4_mapped())
+        return ClientAllowed(
+            boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, address.to_v6()));
 
     std::string ipv4addr = address.to_string();
 
@@ -515,7 +548,7 @@ bool ClientAllowed(const boost::asio::ip::address& address)
      || address == asio::ip::address_v6::loopback()
      || (address.is_v4()
          // Check whether IPv4 addresses match 127.0.0.0/8 (loopback subnet)
-      && (address.to_v4().to_ulong() & 0xff000000) == 0x7f000000))
+      && (address.to_v4().to_uint() & 0xff000000) == 0x7f000000))
         return true;
 
     const string strAddress = address.to_string();
@@ -558,22 +591,26 @@ public:
     }
     bool connect(const std::string &server, const std::string &port) {
 #if (BOOST_VERSION >= 107000)
-        ip::tcp::resolver resolver((boost::asio::io_context &)(stream.get_executor().context()));
+        boost::asio::ip::tcp::resolver resolver(stream.get_executor());
 #else
-        ip::tcp::resolver resolver(stream.get_io_service());
+        boost::asio::ip::tcp::resolver resolver(stream.get_io_service());
 #endif
-        ip::tcp::resolver::query query(server.c_str(), port.c_str());
-        ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-        ip::tcp::resolver::iterator end;
         boost::system::error_code error = asio::error::host_not_found;
-        while (error && endpoint_iterator != end)
-        {
-            stream.lowest_layer().close();
-            stream.lowest_layer().connect(*endpoint_iterator++, error);
-        }
+        // Boost 1.87 removed resolver::query / resolver::iterator; resolve() now
+        // returns a results range that can be iterated directly.
+        boost::asio::ip::tcp::resolver::results_type endpoints =
+        resolver.resolve(server, port, error);
         if (error)
             return false;
-        return true;
+        for (const boost::asio::ip::tcp::resolver::results_type::value_type& entry : endpoints)
+        {
+            stream.lowest_layer().close();
+            error = boost::asio::error::host_not_found;
+            stream.lowest_layer().connect(entry.endpoint(), error);
+            if (!error)
+                return true;
+        }
+        return false;
     }
 
 private:
@@ -596,11 +633,14 @@ template <typename Protocol>
 class AcceptedConnectionImpl : public AcceptedConnection
 {
 public:
+    // Accepts either an io_context/io_service (older Boost) or an executor
+    // (Boost 1.70+, where acceptors no longer expose get_io_service()).
+    template <typename ExecutorOrContext>
     AcceptedConnectionImpl(
-            asio::io_service& io_service,
+            ExecutorOrContext&& executorOrContext,
             ssl::context &context,
             bool fUseSSL) :
-        sslStream(io_service, context),
+        sslStream(std::forward<ExecutorOrContext>(executorOrContext), context),
         _d(sslStream, fUseSSL),
         _stream(_d)
     {
@@ -679,7 +719,7 @@ static void RPCListen(boost::shared_ptr< basic_socket_acceptor<Protocol, SocketA
     // Accept connection
     AcceptedConnectionImpl<Protocol>* conn = new AcceptedConnectionImpl<Protocol>
 #if (BOOST_VERSION >= 107000)
-      ((boost::asio::io_context &)(acceptor->get_executor().context()), context, fUseSSL);
+      (acceptor->get_executor(), context, fUseSSL);
 #else
       (acceptor->get_io_service(), context, fUseSSL);
 #endif
@@ -781,7 +821,7 @@ void ThreadRPCServer2(void* parg)
 
     const bool fUseSSL = GetBoolArg("-rpcssl");
 
-    asio::io_service io_service;
+    asio::io_context io_service;
 
 #if (BOOST_VERSION > 106501)
     ssl::context context(ssl::context::sslv23);
@@ -832,7 +872,7 @@ void ThreadRPCServer2(void* parg)
         acceptor->set_option(boost::asio::ip::v6_only(loopback), v6_only_error);
 
         acceptor->bind(endpoint);
-        acceptor->listen(socket_base::max_connections);
+        acceptor->listen(socket_base::max_listen_connections);
 
         RPCListen(acceptor, context, fUseSSL);
         // Cancel outstanding listen-requests for this acceptor when shutting down
@@ -858,7 +898,7 @@ void ThreadRPCServer2(void* parg)
             acceptor->open(endpoint.protocol());
             acceptor->set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
             acceptor->bind(endpoint);
-            acceptor->listen(socket_base::max_connections);
+            acceptor->listen(socket_base::max_listen_connections);
 
             RPCListen(acceptor, context, fUseSSL);
             // Cancel outstanding listen-requests for this acceptor when shutting down
@@ -986,10 +1026,17 @@ void ThreadRPCServer3(void* parg)
             }
             return;
         }
-        map<string, string> mapHeaders;
-        string strRequest;
 
-        ReadHTTP(conn->stream(), mapHeaders, strRequest);
+        int nProto = 0;
+        map<string, string> mapHeaders;
+        string strRequest, strMethod, strURI;
+
+        // Read HTTP request line
+        if (!ReadHTTPRequestLine(conn->stream(), nProto, strMethod, strURI))
+            break;
+
+        // Read HTTP message headers and body
+        ReadHTTPMessage(conn->stream(), mapHeaders, strRequest, nProto);
 
         // Check authorization
         if (mapHeaders.count("authorization") == 0)
@@ -1101,14 +1148,13 @@ Object CallRPC(const string& strMethod, const Array& params)
 
     // Connect to localhost
     bool fUseSSL = GetBoolArg("-rpcssl");
-    asio::io_service io_service;
+    asio::io_context io_service;
 
 #if (BOOST_VERSION > 106501)
     ssl::context context(ssl::context::sslv23);
 #else
     ssl::context context(io_service, ssl::context::sslv23);
 #endif
-
     context.set_options(ssl::context::no_sslv2);
     asio::ssl::stream<asio::ip::tcp::socket> sslStream(io_service, context);
     SSLIOStreamDevice<asio::ip::tcp> d(sslStream, fUseSSL);
@@ -1126,10 +1172,14 @@ Object CallRPC(const string& strMethod, const Array& params)
     string strPost = HTTPPost(strRequest, mapRequestHeaders);
     stream << strPost << std::flush;
 
-    // Receive reply
+    // Receive HTTP reply status
+    int nProto = 0;
+    int nStatus = ReadHTTPStatus(stream, nProto);
+
+    // Receive HTTP reply message headers and body
     map<string, string> mapHeaders;
     string strReply;
-    int nStatus = ReadHTTP(stream, mapHeaders, strReply);
+    ReadHTTPMessage(stream, mapHeaders, strReply, nProto);
     if (nStatus == HTTP_UNAUTHORIZED)
         throw runtime_error("incorrect rpcuser or rpcpassword (authorization failed)");
     else if (nStatus >= 400 && nStatus != HTTP_BAD_REQUEST && nStatus != HTTP_NOT_FOUND && nStatus != HTTP_INTERNAL_SERVER_ERROR)

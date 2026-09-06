@@ -20,7 +20,6 @@ LIBPATHS= \
  -L"$(DEPSDIR)/lib"
 
 LIBS= \
- -l boost_system-mt-s-x32 \
  -l boost_filesystem-mt-s-x32 \
  -l boost_program_options-mt-s-x32 \
  -l boost_thread-mt-s-x32 \
